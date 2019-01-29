@@ -170,6 +170,11 @@ abstract class Node<K, V> implements AccessOrder<Node<K, V>>, WriteOrder<Node<K,
     return getQueueType() == PROTECTED;
   }
 
+  /** Sets the status to the Eden queue. */
+  public void makeEden() {
+    setQueueType(EDEN);
+  }
+
   /** Sets the status to the Main space's probation queue. */
   public void makeMainProbation() {
     setQueueType(PROBATION);

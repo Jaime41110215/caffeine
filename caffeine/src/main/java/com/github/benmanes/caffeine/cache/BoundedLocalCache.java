@@ -93,6 +93,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
    * This class performs a best-effort bounding of a ConcurrentHashMap using a page-replacement
    * algorithm to determine which entries to evict when the capacity is exceeded.
    *
+   * Concurrency:
+   * ------------
    * The page replacement algorithm's data structures are kept eventually consistent with the map.
    * An update to the map and recording of reads may not be immediately reflected on the algorithm's
    * data structures. These structures are guarded by a lock and operations are applied in batches
@@ -115,6 +117,25 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
    * the hash table nor the page replacement policy. Both the retired and dead states are
    * represented by a sentinel key that should not be used for map lookups.
    *
+   * Eviction:
+   * ---------
+   * Maximum size is implemented using the Window TinyLfu policy due to its high hit rate, O(1) time
+   * complexity, and small footprint. A new entry starts in the eden space and remains there as long
+   * as it has high temporal locality. Eventually an entry will slip from the eden space into the
+   * main space. If the main space is already full, then a historic frequency filter determines
+   * whether to evict the newly admitted entry or the victim entry chosen by main space's policy.
+   * This process ensures that the entries in the main space have both a high recency and frequency.
+   * The windowing allows the policy to have a high hit rate when entries exhibit a bursty (high
+   * temporal, low frequency) access pattern. The eden space uses LRU and the main space uses
+   * Segmented LRU.
+   *
+   * ---REWRITE ---
+   * A per instance smear is used to help protect against hash flooding [3], which would result
+   * in the admission policy always rejecting new candidates. The use of a pseudo random hashing
+   * function resolves the concern of a denial of service attack by exploiting the hash codes.
+   *
+   * Expiration:
+   * -----------
    * Expiration is implemented in O(1) time complexity. The time-to-idle policy uses an access-order
    * queue, the time-to-live policy uses a write-order queue, and variable expiration uses a timer
    * wheel. This allows peeking at the oldest entry in the queue to see if it has expired and, if it
@@ -125,15 +146,16 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
    * expiration may be ignored for an entry if the last update was within a short time window in
    * order to avoid overwhelming the write buffer.
    *
-   * Maximum size is implemented using the Window TinyLfu policy due to its high hit rate, O(1) time
-   * complexity, and small footprint. A new entry starts in the eden space and remains there as long
-   * as it has high temporal locality. Eventually an entry will slip from the eden space into the
-   * main space. If the main space is already full, then a historic frequency filter determines
-   * whether to evict the newly admitted entry or the victim entry chosen by main space's policy.
-   * This process ensures that the entries in the main space have both a high recency and frequency.
-   * The windowing allows the policy to have a high hit rate when entries exhibit a bursty (high
-   * temporal, low frequency) access pattern. The eden space uses LRU and the main space uses
-   * Segmented LRU.
+   * [1]:
+   *
+   * [2] TinyLFU: A Highly Efficient Cache Admission Policy
+   * https://dl.acm.org/citation.cfm?id=3149371
+   * [3] Adaptive Software Cache Management
+   * https://dl.acm.org/citation.cfm?id=3274816
+   * [4] Denial of Service via Algorithmic Complexity Attack
+   * https://www.usenix.org/legacy/events/sec03/tech/full_papers/crosby/crosby.pdf
+   * [5] Hashed and Hierarchical Timing Wheels
+   * http://www.cs.columbia.edu/~nahum/w6998/papers/ton97-timing-wheels.pdf
    */
 
   static final Logger logger = Logger.getLogger(BoundedLocalCache.class.getName());
@@ -152,6 +174,12 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
   static final double PERCENT_MAIN = 0.99d;
   /** The percent of the maximum weighted capacity dedicated to the main's protected space. */
   static final double PERCENT_MAIN_PROTECTED = 0.80d;
+  /** The difference in hit rates that restarts the climber. */
+  static final double HILL_CLIMBER_RESTART_THRESHOLD = 0.05d;
+  /** The percent of the total size to adapt the window by. */
+  static final double HILL_CLIMBER_STEP_PERCENT = 0.0625d;
+  /** The rate to decrease the step size to adapt by. */
+  static final double HILL_CLIMBER_STEP_DECAY_RATE = 0.98d;
   /** The maximum time window between entry updates before the expiration must be reordered. */
   static final long EXPIRE_WRITE_TOLERANCE = TimeUnit.SECONDS.toNanos(1);
   /** The maximum duration before an entry expires. */
@@ -201,7 +229,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     return 1 << -Integer.numberOfLeadingZeros(x - 1);
   }
 
-  /* ---------------- Shared -------------- */
+  /* --------------- Shared --------------- */
 
   /** Returns if the node's value is currently being computed, asynchronously. */
   final boolean isComputingAsync(Node<?, ?> node) {
@@ -247,7 +275,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     return (writer != CacheWriter.disabledWriter());
   }
 
-  /* ---------------- Stats Support -------------- */
+  /* --------------- Stats Support -------------- */
 
   @Override
   public boolean isRecordingStats() {
@@ -264,7 +292,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     return Ticker.disabledTicker();
   }
 
-  /* ---------------- Removal Listener Support -------------- */
+  /* --------------- Removal Listener Support -------------- */
 
   @Override
   @SuppressWarnings("NullAway")
@@ -295,7 +323,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     }
   }
 
-  /* ---------------- Reference Support -------------- */
+  /* --------------- Reference Support -------------- */
 
   /** Returns if the keys are weak reference garbage collected. */
   protected boolean collectKeys() {
@@ -317,7 +345,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     return null;
   }
 
-  /* ---------------- Expiration Support -------------- */
+  /* --------------- Expiration Support -------------- */
 
   /** Returns if the cache expires entries after a variable time threshold. */
   protected boolean expiresVariable() {
@@ -385,7 +413,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     throw new UnsupportedOperationException();
   }
 
-  /* ---------------- Eviction Support -------------- */
+  /* --------------- Eviction Support -------------- */
 
   /** Returns if the cache evicts entries due to a maximum size or weight threshold. */
   protected boolean evicts() {
@@ -436,34 +464,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     throw new UnsupportedOperationException();
   }
 
-  /**
-   * Sets the maximum weighted size of the cache. The caller may need to perform a maintenance cycle
-   * to eagerly evicts entries until the cache shrinks to the appropriate size.
-   */
-  @GuardedBy("evictionLock")
-  void setMaximum(long maximum) {
-    requireArgument(maximum >= 0);
-
-    long max = Math.min(maximum, MAXIMUM_CAPACITY);
-    long eden = max - (long) (max * PERCENT_MAIN);
-    long mainProtected = (long) ((max - eden) * PERCENT_MAIN_PROTECTED);
-
-    lazySetMaximum(max);
-    lazySetEdenMaximum(eden);
-    lazySetMainProtectedMaximum(mainProtected);
-
-    if ((frequencySketch() != null) && !isWeighted() && (weightedSize() >= (max >>> 1))) {
-      // Lazily initialize when close to the maximum size
-      frequencySketch().ensureCapacity(max);
-    }
-  }
-
-  /** Returns the combined weight of the values in the cache. */
-  long adjustedWeightedSize() {
-    return Math.max(0, weightedSize());
-  }
-
-  /** Returns the uncorrected combined weight of the values in the cache. */
+  /** Returns the combined weight of the values in the cache (may be negative). */
   protected long weightedSize() {
     throw new UnsupportedOperationException();
   }
@@ -491,6 +492,77 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
   @GuardedBy("evictionLock") // must write under lock
   protected void lazySetMainProtectedWeightedSize(long weightedSize) {
     throw new UnsupportedOperationException();
+  }
+
+  protected int hitsInSample() {
+    throw new UnsupportedOperationException();
+  }
+
+  protected int missesInSample() {
+    throw new UnsupportedOperationException();
+  }
+
+  protected int sampleCount() {
+    throw new UnsupportedOperationException();
+  }
+
+  protected double stepSize() {
+    throw new UnsupportedOperationException();
+  }
+
+  protected double previousSampleHitRate() {
+    throw new UnsupportedOperationException();
+  }
+
+  @GuardedBy("evictionLock") // must write under lock
+  protected void setHitsInSample(int hitCount) {
+    throw new UnsupportedOperationException();
+  }
+
+  @GuardedBy("evictionLock") // must write under lock
+  protected void setMissesInSample(int missCount) {
+    throw new UnsupportedOperationException();
+  }
+
+  @GuardedBy("evictionLock") // must write under lock
+  protected void setSampleCount(int sampleCount) {
+    throw new UnsupportedOperationException();
+  }
+
+  @GuardedBy("evictionLock") // must write under lock
+  protected void setStepSize(double stepSize) {
+    throw new UnsupportedOperationException();
+  }
+
+  @GuardedBy("evictionLock") // must write under lock
+  protected void setPreviousSampleHitRate(double hitRate) {
+    throw new UnsupportedOperationException();
+  }
+
+  /**
+   * Sets the maximum weighted size of the cache. The caller may need to perform a maintenance cycle
+   * to eagerly evicts entries until the cache shrinks to the appropriate size.
+   */
+  @GuardedBy("evictionLock")
+  void setMaximum(long maximum) {
+    requireArgument(maximum >= 0);
+
+    long max = Math.min(maximum, MAXIMUM_CAPACITY);
+    long eden = max - (long) (PERCENT_MAIN * max);
+    long mainProtected = (long) (PERCENT_MAIN_PROTECTED * (max - eden));
+
+    lazySetMaximum(max);
+    lazySetEdenMaximum(eden);
+    lazySetMainProtectedMaximum(mainProtected);
+
+    setHitsInSample(0);
+    setMissesInSample(0);
+    setStepSize(-HILL_CLIMBER_STEP_PERCENT * max);
+
+    if ((frequencySketch() != null) && !isWeighted() && (weightedSize() >= (max >>> 1))) {
+      // Lazily initialize when close to the maximum size
+      frequencySketch().ensureCapacity(max);
+    }
   }
 
   /** Evicts entries if the cache exceeds the maximum. */
@@ -831,6 +903,126 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     return true;
   }
 
+  @GuardedBy("evictionLock")
+  void climb() {
+    if (!evicts()) {
+      return;
+    }
+
+    long amount = adapt();
+    if (amount == 0) {
+      return;
+    } else if (amount > 0) {
+      increaseWindow(amount);
+    } else {
+      decreaseWindow(-amount);
+    }
+  }
+
+  /**
+   *
+   * @return
+   */
+  @GuardedBy("evictionLock")
+  long adapt() {
+    if (frequencySketch().isNotInitialized()) {
+      setPreviousSampleHitRate(0.0);
+      setMissesInSample(0);
+      setHitsInSample(0);
+      return 0L;
+    }
+
+    int requestCount = hitsInSample() + missesInSample();
+    if (requestCount < frequencySketch().sampleSize) {
+      return 0L;
+    }
+
+    double hitRate = (double) hitsInSample() / requestCount;
+    double hitRateChange = hitRate - previousSampleHitRate();
+    double amount = (hitRateChange >= 0) ? stepSize() : -stepSize();
+    double nextStepSize = (Math.abs(hitRateChange) < HILL_CLIMBER_RESTART_THRESHOLD)
+        ? HILL_CLIMBER_STEP_DECAY_RATE * amount
+        : HILL_CLIMBER_STEP_PERCENT * maximum();
+    setPreviousSampleHitRate(hitRate);
+    setStepSize(nextStepSize);
+    setMissesInSample(0);
+    setHitsInSample(0);
+
+    return (long) amount;
+  }
+
+  @GuardedBy("evictionLock")
+  void increaseWindow(long amount) {
+    if (mainProtectedMaximum() == 0) {
+      return;
+    }
+
+    long quota = Math.min(amount, mainProtectedMaximum());
+    lazySetMainProtectedMaximum(mainProtectedMaximum() - quota);
+    lazySetEdenMaximum(edenMaximum() + quota);
+
+    // demote entries from main's protected queue to the probation queue
+    while (mainProtectedWeightedSize() > mainProtectedMaximum()) {
+      Node<K, V> demoted = accessOrderProtectedDeque().poll();
+      if (demoted == null) {
+        break;
+      }
+
+      demoted.makeMainProbation();
+      accessOrderProbationDeque().add(demoted);
+      lazySetMainProtectedWeightedSize(mainProtectedWeightedSize() - demoted.getPolicyWeight());
+    }
+
+    for (;;) {
+      Node<K, V> candidate = accessOrderProbationDeque().peek();
+      if (candidate == null) {
+        return;
+      }
+
+      int weight = candidate.getPolicyWeight();
+      quota -= weight;
+      if (quota < 0) {
+        return;
+      }
+
+      lazySetMainProtectedWeightedSize(mainProtectedWeightedSize() - weight);
+      lazySetEdenWeightedSize(edenWeightedSize() + weight);
+      accessOrderProbationDeque().remove(candidate);
+      accessOrderEdenDeque().add(candidate);
+      candidate.makeEden();
+    }
+  }
+
+  @GuardedBy("evictionLock")
+  void decreaseWindow(long amount) {
+    if (edenMaximum() == 0) {
+      return;
+    }
+
+    long quota = Math.min(amount, edenMaximum());
+    lazySetMainProtectedMaximum(mainProtectedMaximum() + quota);
+    lazySetEdenMaximum(edenMaximum() - quota);
+
+    for (;;) {
+      Node<K, V> candidate = accessOrderEdenDeque().peek();
+      if (candidate == null) {
+        return;
+      }
+
+      int weight = candidate.getPolicyWeight();
+      quota -= weight;
+      if (quota < 0) {
+        return;
+      }
+
+      lazySetMainProtectedWeightedSize(mainProtectedWeightedSize() + weight);
+      lazySetEdenWeightedSize(edenWeightedSize() - weight);
+      accessOrderEdenDeque().remove(candidate);
+      accessOrderProbationDeque().add(candidate);
+      candidate.makeMainProbation();
+    }
+  }
+
   /**
    * Performs the post-processing work required after a read.
    *
@@ -1141,6 +1333,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
 
       expireEntries();
       evictEntries();
+
+      climb();
     } finally {
       if ((drainStatus() != PROCESSING_TO_IDLE) || !casDrainStatus(PROCESSING_TO_IDLE, IDLE)) {
         lazySetDrainStatus(REQUIRED);
@@ -1204,6 +1398,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
       } else {
         reorder(accessOrderProtectedDeque(), node);
       }
+      setHitsInSample(hitsInSample() + 1);
     } else if (expiresAfterAccess()) {
       reorder(accessOrderEdenDeque(), node);
     }
@@ -1324,6 +1519,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
         if (key != null) {
           frequencySketch().increment(key);
         }
+
+        setMissesInSample(missesInSample() + 1);
       }
 
       // ignore out-of-order write operations
@@ -1420,7 +1617,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     }
   }
 
-  /* ---------------- Concurrent Map Support -------------- */
+  /* --------------- Concurrent Map Support -------------- */
 
   @Override
   public boolean isEmpty() {
@@ -3032,7 +3229,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     return proxy;
   }
 
-  /* ---------------- Manual Cache -------------- */
+  /* --------------- Manual Cache -------------- */
 
   static class BoundedLocalManualCache<K, V> implements LocalManualCache<K, V>, Serializable {
     private static final long serialVersionUID = 1;
@@ -3151,7 +3348,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
         if (cache.evicts() && isWeighted()) {
           cache.evictionLock.lock();
           try {
-            return OptionalLong.of(cache.adjustedWeightedSize());
+            return OptionalLong.of(Math.max(0, cache.weightedSize()));
           } finally {
             cache.evictionLock.unlock();
           }
@@ -3355,7 +3552,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     }
   }
 
-  /* ---------------- Loading Cache -------------- */
+  /* --------------- Loading Cache -------------- */
 
   static final class BoundedLocalLoadingCache<K, V>
       extends BoundedLocalManualCache<K, V> implements LocalLoadingCache<K, V> {
@@ -3414,7 +3611,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     }
   }
 
-  /* ---------------- Async Cache -------------- */
+  /* --------------- Async Cache -------------- */
 
   static final class BoundedLocalAsyncCache<K, V> implements LocalAsyncCache<K, V>, Serializable {
     private static final long serialVersionUID = 1;
@@ -3469,7 +3666,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     }
   }
 
-  /* ---------------- Async Loading Cache -------------- */
+  /* --------------- Async Loading Cache -------------- */
 
   static final class BoundedLocalAsyncLoadingCache<K, V>
       extends LocalAsyncLoadingCache<K, V> implements Serializable {
